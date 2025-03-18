@@ -1,10 +1,24 @@
 import pandas as pd
 import os
+import pyodbc
+import warnings
+
+# Ignore the FutureWarning related to DataFrame concatenation
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+def load_query(filename):
+    with open(filename, 'r') as file:
+        return file.read()
+    
+work_orders_query_file = "C:\\Users\\sdunna\\OneDrive - KBI Biopharma\\Documents - CMF-SC\\Pick List Files\\work_orders_query.sql"
+inventory_query_file = "C:\\Users\\sdunna\\OneDrive - KBI Biopharma\\Documents - CMF-SC\\Pick List Files\\inventory_query.sql"
+
+work_orders_query = load_query(work_orders_query_file)
+inventory_query = load_query(inventory_query_file)
+
 
 # File paths
 override_file = "C:\\Users\\sdunna\\OneDrive - KBI Biopharma\\Planner WO BOM Swaps\\Planners WO BOM Swaps List.xlsx"
-work_orders_file = "C:\\Users\\sdunna\\OneDrive - KBI Biopharma\\Documents - CMF-SC\\Pick List Files\\Work Orders.xlsx"
-inventory_file = "C:\\Users\\sdunna\\OneDrive - KBI Biopharma\\Documents - CMF-SC\\Pick List Files\\Inventory.xlsx"
 
 # Load data with error handling
 def load_excel(file_path):
@@ -17,26 +31,39 @@ def load_excel(file_path):
         print(f"Error loading {file_path}: {e}")
         return pd.DataFrame()
 
-work_orders = load_excel(work_orders_file)
-inventory = load_excel(inventory_file)
+# Set up the connection string with Windows Authentication
+conn_str = (
+    r'DRIVER={ODBC Driver 17 for SQL Server};'
+    r'SERVER=ddur-sql03\WWEST;'  # Replace with your SQL Server name or IP
+    r'DATABASE=FDW;'  # Replace with your database name
+    r'Trusted_Connection=yes;'  # This enables Windows Authentication
+)
+
+# Establish the connection
+conn = pyodbc.connect(conn_str)
+
+# Create a cursor to interact with the database
+cursor = conn.cursor()
+
+work_orders = pd.read_sql(work_orders_query, conn)
+inventory = pd.read_sql(inventory_query, conn)
 overrides = load_excel(override_file)
+
+cursor.close()
+conn.close()
+
 
 # Filter inventory based on CUSTOM_DATA1(Location Category) values
 valid_location_categories = ["CMF Warehouse", "CMF Warehouse - Cold", "W1", "W2", "W3", "W4"]
 inventory = inventory[inventory['CUSTOM_DATA1'].isin(valid_location_categories)]
 
-# Ensure necessary columns exist
-def validate_columns(df, required_columns, name):
-    missing = [col for col in required_columns if col not in df.columns]
-    if missing:
-        print(f"Error: Missing columns {missing} in {name}")
-        return False
-    return True
+# Apply additional filtering logic
+if 'BOM_CUSTOM_DATA1' in inventory.columns and 'CUSTOM_DATA1' in inventory.columns and 'ITEM_ID' in inventory.columns:
+    inventory = inventory[
+        (inventory['BOM_CUSTOM_DATA1'] != 'MFG Only') &  # Exclude 'MFG Only'
+        ~((inventory['CUSTOM_DATA1'] == 'Downstream') & (inventory['ITEM_ID'].astype(str).str.startswith(('1', '7'))))  # Exclude Downstream + 1/7
+    ]
 
-if not validate_columns(work_orders, ['SCHED_DATETIME', 'COMP_ITEMID', 'WORKORDER_ID', 'SITE_ID', 'QTY', 'SEQ_NUM', 'ORIG_CODE', 'PROJECT_NUMBER', 'PROD_BATCH_NUM'], 'work_orders') or \
-   not validate_columns(inventory, ['ITEM_ID', 'QTYTOTAL', 'EXPDATE', 'SKIDID', 'LOTID', 'LOC_ID', 'ITEMDESC', 'SITE_ID', 'CUSTOM_DATA1'], 'inventory') or \
-   not validate_columns(overrides, ['Swap Level', 'Project Number', 'Work Order ID', 'Production Batch Number', 'Original KBI Item Number', 'Substitute KBI Item Number'], 'overrides'):
-    exit()
 
 # Convert columns to correct types
 work_orders['SCHED_DATETIME'] = pd.to_datetime(work_orders['SCHED_DATETIME'], errors='coerce')
@@ -50,7 +77,7 @@ inventory.sort_values(by=['ITEM_ID', 'EXPDATE'], inplace=True)
 # Create inventory dictionary
 inventory_dict = inventory.groupby(['SITE_ID', 'ITEM_ID']).apply(lambda x: x.to_dict(orient='records')).to_dict()
 
-# Function to get substitute based on override Swap Levels
+# Function to get substitute based on override levels
 def get_substitute(item_id, workorder_id, project_number, batch_number):
     override = overrides[(
         (overrides['Swap Level'] == 'Project') & (overrides['Project Number'] == project_number) |
@@ -81,20 +108,24 @@ for _, row in work_orders.iterrows():
     workorder_id = row['WORKORDER_ID']
     project_number = row['PROJECT_NUMBER']
     batch_number = row['PROD_BATCH_NUM']
+    prod_batch_id = row['PROD_ITEMID']
+    orig_code = row['ORIG_CODE']
     custom_data = row['CUSTOM_DATA1']
+    bom_custom_data = row['BOM_CUSTOM_DATA1']
     item_id = get_substitute(row['COMP_ITEMID'], workorder_id, project_number, batch_number)
     qty_needed = row['QTY']
+    site_id = row['SITE_ID']  # Keep as string
     original_qty_needed = qty_needed
-    
-    site_options = [row['SITE_ID']]
-    if row['SITE_ID'] == 2:
-        site_options.insert(0, 5)
+
+    site_options = [site_id]
+    if site_id == '2':  # Compare as string
+        site_options.insert(0, '5')  # Insert '5' as string
 
     total_allocated = 0
     for site_id in site_options:
         if (site_id, item_id) not in inventory_dict:
             continue
-        
+
         lot_list = inventory_dict[(site_id, item_id)]
         new_lot_list = []
 
@@ -111,36 +142,38 @@ for _, row in work_orders.iterrows():
             total_allocated += qty_to_pick
 
             allocations.append({
-                "Project ID": project_number,
-                "Production Batch Number": batch_number,
+                "Project Number": project_number,
+                "Batch ID": batch_number,
+                "Production ID": prod_batch_id,
                 "Custom Data": custom_data,
-                "WORKORDER_ID": workorder_id,
-                "ITEM_ID": item_id,
-                "TOTAL_QTY_TO_PICK": original_qty_needed,
-                "LOT_QTY_TO_PICK": qty_to_pick,
-                "SKIDID": lot['SKIDID'],
-                "LOTID": lot['LOTID'],
-                "LOC_ID": lot['LOC_ID'],
+                "BoM Custom Data": bom_custom_data,
+                "Work Order ID": workorder_id,
+                "Item ID": item_id,
+                "Original/Substitute": orig_code,
+                "Total Qty to Pick": original_qty_needed,
+                "Lot Qty to Pick": qty_to_pick,
+                "Lot ID": lot['LOTID'],
+                "Location ID": lot['LOC_ID'],
                 "Expiration Date": lot['EXPDATE'],
                 "Item Description": lot['ITEMDESC'],
                 "Stock UoM": lot['STOCK_UOM'],
-                "SOURCE_SITE_ID": site_id,
-                "TARGET_SITE_ID": row['SITE_ID'],
-                "SCHED_DATETIME": row['SCHED_DATETIME'],
-                "UNFULFILLED_QTY": original_qty_needed - total_allocated,
-                "ALLOCATION_STATUS": "Fully Allocated" if total_allocated == original_qty_needed else ("Partially Allocated" if total_allocated > 0 else "Not Allocated")
+                "Source Site ID": site_id,
+                "Target Site ID": row['SITE_ID'],
+                "Scheduled Date": row['SCHED_DATETIME'],
+                "Unfulfilled Qty": original_qty_needed - total_allocated,
+                "Allocation Status": "Fully Allocated" if total_allocated == original_qty_needed else ("Partially Allocated" if total_allocated > 0 else "Not Allocated")
             })
-            
+
             lot['QTYTOTAL'] -= qty_to_pick
             qty_needed -= qty_to_pick
 
             if lot['QTYTOTAL'] > 0:
                 new_lot_list.append(lot)
-        
+
         inventory_dict[(site_id, item_id)] = new_lot_list
         if qty_needed <= 0:
             break
-    
+
     if qty_needed > 0:
         substitute_item = find_substitute(row['SEQ_NUM'])
         if substitute_item:
@@ -148,6 +181,7 @@ for _, row in work_orders.iterrows():
             new_row['COMP_ITEMID'] = substitute_item
             new_row['ORIG_CODE'] = 'S'
             work_orders = pd.concat([work_orders, new_row.to_frame().T], ignore_index=True)
+
 
 # Convert allocations to DataFrame and save
 pick_list = pd.DataFrame(allocations)
